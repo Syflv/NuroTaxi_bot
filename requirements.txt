@@ -1,3 +1,2 @@
 aiogram==2.23.1
-aiohttp==3.9.1
-asyncio
+aiohttp>=3.8.0,<3.9.0
