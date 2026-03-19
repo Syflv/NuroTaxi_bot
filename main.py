@@ -1,21 +1,35 @@
 import logging
 import sqlite3
+import asyncio
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+from aiohttp import web # Render uchun kerak
 
-# Bot tokeningizni bura yozing
+# --- SOZLAMALAR ---
 API_TOKEN = '8399783426:AAHyEHTD364aYa5uiniKwg6SuNq2Ign8QjU'
+ADMIN_ID = 2085230699 # O'z ID-ingizni yozing
 
-# Logging va Bot sozlamalari
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-# --- DATABASE QISMI ---
+# --- RENDER UCHUN HEALTH CHECK (BOT O'CHIB QOLMASLIGI UCHUN) ---
+async def handle_health_check(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 10000) # Render kutayotgan port
+    await site.start()
+
+# --- DATABASE ---
 def init_db():
     conn = sqlite3.connect('taxi_bot.db')
     cursor = conn.cursor()
@@ -39,7 +53,7 @@ def get_taxis():
     conn.close()
     return [t[0] for t in taxis]
 
-# --- STATES (Holatlar) ---
+# --- STATES ---
 class Registration(StatesGroup):
     role = State()
     phone = State()
@@ -52,7 +66,11 @@ class Order(StatesGroup):
 class Bid(StatesGroup):
     price = State()
 
-# --- START ---
+class AdminContact(StatesGroup):
+    message = State()
+
+# --- HANDLERS (AVVALGI FUNKSIYALAR) ---
+
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
@@ -62,12 +80,8 @@ async def cmd_start(message: types.Message):
 
 @dp.message_handler(state=Registration.role)
 async def process_role(message: types.Message, state: FSMContext):
-    if message.text not in ["Taksist 🚖", "Yo'lovchi 🙋‍♂️"]:
-        return await message.answer("Iltimos, tugmalardan birini tanlang.")
-    
     role = 'taksist' if "Taksist" in message.text else 'yolovchi'
     await state.update_data(user_role=role)
-    
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     markup.add(KeyboardButton("Kontaktni ulashish 📱", request_contact=True))
     await message.answer("Telefon raqamingizni yuboring:", reply_markup=markup)
@@ -76,23 +90,43 @@ async def process_role(message: types.Message, state: FSMContext):
 @dp.message_handler(content_types=['contact'], state=Registration.phone)
 async def process_phone(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    role = data['user_role']
-    phone = message.contact.phone_number
-    
+    role, phone = data['user_role'], message.contact.phone_number
     save_user(message.from_user.id, role, phone)
     
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
     if role == 'taksist':
-        await message.answer("Siz taksist sifatida ro'yxatdan o'tdingiz. Yangi safarlar haqida xabar beramiz.", reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add("Adminga murojaat ✍️"))
+        markup.add("Adminga murojaat ✍️")
+        await message.answer("Taksist sifatida ro'yxatdan o'tdingiz.", reply_markup=markup)
     else:
-        markup = ReplyKeyboardMarkup(resize_keyboard=True)
         markup.add("Safarni rejalashtirish 🗓", "Adminga xabar ✍️")
         await message.answer("Yo'lovchi sifatida ro'yxatdan o'tdingiz.", reply_markup=markup)
     await state.finish()
 
-# --- BUYURTMA BERISH (YO'LOVCHI) ---
-@dp.message_handler(lambda message: message.text == "Safarni rejalashtirish 🗓")
+@dp.message_handler(lambda m: "Adminga" in m.text)
+async def admin_start(message: types.Message):
+    await message.answer("Marhamat, xatolik yoki takliflarni yozing. Admin tezda bog'lanadi.", reply_markup=ReplyKeyboardRemove())
+    await AdminContact.message.set()
+
+@dp.message_handler(state=AdminContact.message)
+async def admin_send(message: types.Message, state: FSMContext):
+    await bot.send_message(ADMIN_ID, f"👤 Kimdan: {message.from_user.full_name}\n🆔 ID: {message.from_user.id}\n📝 Xabar: {message.text}")
+    
+    conn = sqlite3.connect('taxi_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT role FROM users WHERE user_id = ?", (message.from_user.id,))
+    role = cursor.fetchone()[0]
+    conn.close()
+    
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    if role == 'taksist': markup.add("Adminga murojaat ✍️")
+    else: markup.add("Safarni rejalashtirish 🗓", "Adminga xabar ✍️")
+    
+    await message.answer("Xabaringiz adminga yuborildi.", reply_markup=markup)
+    await state.finish()
+
+@dp.message_handler(lambda m: m.text == "Safarni rejalashtirish 🗓")
 async def start_order(message: types.Message):
-    await message.answer("Qayerdan qayerga bormoqchisiz?")
+    await message.answer("Qayerdan qayerga bormoqchisiz?", reply_markup=ReplyKeyboardRemove())
     await Order.route.set()
 
 @dp.message_handler(state=Order.route)
@@ -104,67 +138,55 @@ async def process_route(message: types.Message, state: FSMContext):
 @dp.message_handler(state=Order.passengers)
 async def process_passengers(message: types.Message, state: FSMContext):
     await state.update_data(passengers=message.text)
-    await message.answer("Aloqa uchun telefon raqamingizni yozing:")
+    await message.answer("Aloqa uchun telefon raqamingiz:")
     await Order.client_phone.set()
 
 @dp.message_handler(state=Order.client_phone)
 async def process_client_phone(message: types.Message, state: FSMContext):
-    order_data = await state.get_data()
-    route = order_data['route']
-    passengers = order_data['passengers']
-    phone = message.text
-    
+    data = await state.get_data()
+    route, passengers, phone = data['route'], data['passengers'], message.text
     taxis = get_taxis()
-    text = f"🆕 Yangi buyurtma!\n📍 Yo'nalish: {route}\n👥 Odam soni: {passengers}\n\nNarxingizni taklif qiling:"
-    
-    for taxi_id in taxis:
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("Narx yozish 💰", callback_data=f"bid_{message.from_user.id}_{phone}"))
-        await bot.send_message(taxi_id, text, reply_markup=markup)
-    
-    await message.answer("Buyurtmangiz taksistlarga yuborildi. Narxlarni kuting.")
+    for t_id in taxis:
+        markup = InlineKeyboardMarkup().add(InlineKeyboardButton("Narx yozish 💰", callback_data=f"bid_{message.from_user.id}_{phone}"))
+        await bot.send_message(t_id, f"🆕 Safar!\n📍 Yo'nalish: {route}\n👥 Odam: {passengers}\n💰 Narx taklif qiling:", reply_markup=markup)
+    await message.answer("Buyurtma taksistlarga yuborildi.")
     await state.finish()
 
-# --- NARX TAKLIF QILISH (TAKSIST) ---
 @dp.callback_query_handler(lambda c: c.data.startswith('bid_'))
 async def taxi_bid(callback_query: types.CallbackQuery, state: FSMContext):
-    _, client_id, client_phone = callback_query.data.split('_')
-    await state.update_data(bid_client_id=client_id, bid_client_phone=client_phone)
-    await bot.send_message(callback_query.from_user.id, "Mijoz uchun narxingizni yuboring (masalan: 20000):")
+    _, c_id, c_phone = callback_query.data.split('_')
+    await state.update_data(bid_client_id=c_id, bid_client_phone=c_phone)
+    await bot.send_message(callback_query.from_user.id, "Mijozga narxingizni yozing:")
     await Bid.price.set()
     await callback_query.answer()
 
 @dp.message_handler(state=Bid.price)
 async def receive_price(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    client_id = data['bid_client_id']
-    
+    c_id, c_phone = data['bid_client_id'], data['bid_client_phone']
     conn = sqlite3.connect('taxi_bot.db')
     cursor = conn.cursor()
     cursor.execute("SELECT phone FROM users WHERE user_id = ?", (message.from_user.id,))
-    taxi_phone = cursor.fetchone()[0]
+    t_phone = cursor.fetchone()[0]
     conn.close()
-
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("Tanlash ✅", callback_data=f"accept_{message.from_user.id}_{taxi_phone}"))
-    
-    await bot.send_message(client_id, f"Haydovchidan taklif: {message.text} so'm", reply_markup=markup)
-    await message.answer("Narxingiz mijozga yuborildi.")
+    markup = InlineKeyboardMarkup().add(InlineKeyboardButton("Tanlash ✅", callback_data=f"accept_{message.from_user.id}_{t_phone}_{c_phone}"))
+    await bot.send_message(c_id, f"Haydovchi narxi: {message.text} so'm", reply_markup=markup)
+    await message.answer("Narx yuborildi.")
     await state.finish()
 
-# --- TANLASH (YO'LOVCHI) ---
 @dp.callback_query_handler(lambda c: c.data.startswith('accept_'))
 async def accept_taxi(callback_query: types.CallbackQuery):
-    _, taxi_id, taxi_phone = callback_query.data.split('_')
-    
-    # Mijozga haydovchi raqami
-    await callback_query.message.answer(f"✅ Haydovchi tanlandi!\n📞 Tel: {taxi_phone}\nBog'lanishingiz mumkin.")
-    
-    # Haydovchiga mijoz raqami
-    await bot.send_message(taxi_id, "✅ Mijoz sizni tanladi!")
-    
-    await callback_query.answer("Muvaffaqiyatli tanlandi!")
+    _, t_id, t_phone, c_phone = callback_query.data.split('_')
+    markup = ReplyKeyboardMarkup(resize_keyboard=True).add("Safarni rejalashtirish 🗓", "Adminga xabar ✍️")
+    await callback_query.message.answer(f"✅ Safar tasdiqlandi!\n🚖 Haydovchi tel: {t_phone}", reply_markup=markup)
+    await bot.send_message(t_id, f"✅ Mijoz sizni tanladi!\n📞 Mijoz tel: {c_phone}")
+    await callback_query.answer()
 
+# --- BOTNI ISHGA TUSHIRISH ---
 if __name__ == '__main__':
     init_db()
+    # Web serverni fonda ishga tushirish
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_web_server())
+    # Botni ishga tushirish
     executor.start_polling(dp, skip_updates=True)
