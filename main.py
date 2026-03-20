@@ -26,7 +26,6 @@ def init_db():
                       (user_id INTEGER PRIMARY KEY, role TEXT, phone TEXT, username TEXT)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS settings 
                       (key TEXT PRIMARY KEY, value TEXT)''')
-    # Standart kanalni yozib qo'yamiz
     cursor.execute("INSERT OR IGNORE INTO settings VALUES ('channel', '@NuroTaxi')")
     conn.commit()
     conn.close()
@@ -74,9 +73,18 @@ class Registration(StatesGroup):
     role = State()
     phone = State()
 
+class Order(StatesGroup):
+    route = State()
+    passengers = State()
+    travel_time = State()  # Safar vaqti qo'shildi
+    client_phone = State()
+
 class AdminStates(StatesGroup):
     broadcast_msg = State()
     new_channel = State()
+
+class AdminContact(StatesGroup):
+    waiting_msg = State()
 
 # --- KLAVIATURALAR ---
 def main_menu(user_id):
@@ -149,13 +157,12 @@ async def check_callback(call: types.CallbackQuery, state: FSMContext):
     else:
         await call.answer("Siz hali a'zo emassiz!", show_alert=True)
 
+# --- RO'YXATDAN O'TISH ---
 @dp.message(Registration.role)
 async def set_role(message: types.Message, state: FSMContext):
     role = 'taksist' if "Taksist" in message.text else 'yolovchi'
     await state.update_data(role=role)
-    kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="Kontakt 📱", request_contact=True)]
-    ], resize_keyboard=True, one_time_keyboard=True)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Kontakt 📱", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
     await message.answer("Telefon raqamingizni yuboring:", reply_markup=kb)
     await state.set_state(Registration.phone)
 
@@ -167,6 +174,65 @@ async def set_phone(message: types.Message, state: FSMContext):
     await message.answer("Muvaffaqiyatli ro'yxatdan o'tdingiz!", reply_markup=main_menu(message.from_user.id))
     await state.clear()
 
+# --- SAFAR REJALASHTIRISH ---
+@dp.message(F.text == "Safarni rejalashtirish 🗓")
+async def start_order(message: types.Message, state: FSMContext):
+    await message.answer("Qayerdan qayerga bormoqchisiz?\n(Masalan: Toshkent -> Samarqand)")
+    await state.set_state(Order.route)
+
+@dp.message(Order.route)
+async def process_route(message: types.Message, state: FSMContext):
+    await state.update_data(route=message.text)
+    await message.answer("Nechta yo'lovchi? (Masalan: 3 kishi)")
+    await state.set_state(Order.passengers)
+
+@dp.message(Order.passengers)
+async def process_passengers(message: types.Message, state: FSMContext):
+    await state.update_data(passengers=message.text)
+    await message.answer("Safar vaqtini yozing:\n(Masalan: Ertaga soat 08:00 da)")
+    await state.set_state(Order.travel_time)
+
+@dp.message(Order.travel_time)
+async def process_time(message: types.Message, state: FSMContext):
+    await state.update_data(travel_time=message.text)
+    user_data = get_user(message.from_user.id)
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text=f"{user_data[1]}")],
+        [KeyboardButton(text="Boshqa raqam 📱", request_contact=True)]
+    ], resize_keyboard=True)
+    await message.answer("Bog'lanish uchun raqamingizni tasdiqlang:", reply_markup=kb)
+    await state.set_state(Order.client_phone)
+
+@dp.message(Order.client_phone)
+async def process_order_finish(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    phone = message.contact.phone_number if message.contact else message.text
+    order_text = (f"🆕 YANGI BUYURTMA!\n"
+                  f"📍 Yo'nalish: {data['route']}\n"
+                  f"👥 Yo'lovchi: {data['passengers']}\n"
+                  f"⏰ Vaqt: {data['travel_time']}\n"
+                  f"📱 Tel: {phone}\n"
+                  f"👤 Mijoz: @{message.from_user.username or 'Yo'q'}")
+    
+    await bot.send_message(ADMIN_ID, order_text)
+    await message.answer("Buyurtmangiz adminga yuborildi!", reply_markup=main_menu(message.from_user.id))
+    await state.clear()
+
+# --- ADMINGA XABAR ---
+@dp.message(F.text.contains("Adminga"))
+async def start_contact(message: types.Message, state: FSMContext):
+    await message.answer("Xabaringizni yozing:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🚫 Bekor qilish")]], resize_keyboard=True))
+    await state.set_state(AdminContact.waiting_msg)
+
+@dp.message(AdminContact.waiting_msg)
+async def send_to_admin(message: types.Message, state: FSMContext):
+    if message.text == "🚫 Bekor qilish":
+        await state.clear()
+        return await message.answer("Bekor qilindi.", reply_markup=main_menu(message.from_user.id))
+    await bot.send_message(ADMIN_ID, f"✉️ XABAR:\nID: {message.from_user.id}\n@{message.from_user.username}\n\n{message.text}")
+    await message.answer("Yuborildi!", reply_markup=main_menu(message.from_user.id))
+    await state.clear()
+
 # --- ADMIN PANEL ---
 @dp.message(F.text == "📊 Statistika", F.from_user.id == ADMIN_ID)
 async def admin_stat(message: types.Message):
@@ -175,22 +241,20 @@ async def admin_stat(message: types.Message):
 
 @dp.message(F.text == "⚙️ Kanalni sozlash", F.from_user.id == ADMIN_ID)
 async def set_channel_cmd(message: types.Message, state: FSMContext):
-    current = get_setting('channel')
-    await message.answer(f"Hozirgi kanal: {current}\nYangi kanal username'ini yuboring (masalan: @NuroTaxi):")
+    await message.answer(f"Yangi kanal username'ini yuboring (masalan: @NuroTaxi):")
     await state.set_state(AdminStates.new_channel)
 
 @dp.message(AdminStates.new_channel)
 async def update_channel(message: types.Message, state: FSMContext):
     if message.text.startswith("@"):
         update_setting('channel', message.text)
-        await message.answer(f"Kanal muvaffaqiyatli yangilandi: {message.text}", reply_markup=main_menu(ADMIN_ID))
+        await message.answer(f"Kanal yangilandi: {message.text}", reply_markup=main_menu(ADMIN_ID))
         await state.clear()
-    else:
-        await message.answer("Xato! Username @ belgisi bilan boshlanishi kerak.")
+    else: await message.answer("Xato! @ bilan boshlang.")
 
 @dp.message(F.text == "📢 Reklama", F.from_user.id == ADMIN_ID)
 async def admin_broadcast(message: types.Message, state: FSMContext):
-    await message.answer("Reklama xabarini yozing:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🚫 Bekor qilish")]], resize_keyboard=True))
+    await message.answer("Reklama matnini yuboring:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🚫 Bekor qilish")]], resize_keyboard=True))
     await state.set_state(AdminStates.broadcast_msg)
 
 @dp.message(AdminStates.broadcast_msg)
@@ -198,9 +262,7 @@ async def send_broadcast(message: types.Message, state: FSMContext):
     if message.text == "🚫 Bekor qilish":
         await state.clear()
         return await message.answer("Bekor qilindi.", reply_markup=main_menu(ADMIN_ID))
-    
     users = get_all_users()
-    await message.answer(f"{len(users)} kishiga yuborish boshlandi...")
     for u_id in users:
         try:
             await bot.send_message(u_id, message.text)
